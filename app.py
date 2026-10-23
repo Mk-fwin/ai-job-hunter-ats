@@ -204,6 +204,34 @@ def salary_lpa(text):
     return (min(vals[:2]), max(vals[:2])) if vals else None
 
 
+
+def remote_eligibility(job):
+    """Conservative eligibility: never infer India eligibility from 'remote' alone."""
+    loc = str(job.get('location') or '').lower()
+    desc = str(job.get('description') or '').lower()
+    text = loc + ' ' + desc
+    negative = [r'\bhybrid\b', r'\bon[- ]site\b', r'\bin[- ]office\b',
+                r'\bmust (?:be |reside |live |be based )?(?:in )?(?:the )?(?:us|usa|united states|canada|uk|united kingdom|europe|eu)\b',
+                r'\b(?:us|usa|united states|canada|uk|united kingdom|europe|eu)[ -]only\b',
+                r'\bremote (?:only )?(?:in|within|from) (?:the )?(?:us|usa|united states|canada|uk|united kingdom|europe|eu)\b',
+                r'\bnot (?:available|open|eligible) (?:in|to|for) india\b',
+                r'\b(?:india|indian) (?:candidates|applicants|residents) (?:are )?not eligible\b']
+    if any(re.search(pattern, text) for pattern in negative):
+        return 'Exclude', 'Hybrid, on-site, or explicit location restriction'
+    remote = bool(re.search(r'\bremote\b|\bwork from home\b|\bwfh\b|\bwork from anywhere\b|\bdistributed team\b', text))
+    # Job descriptions often say 'remote' in benefits even for office roles;
+    # require the work arrangement in the location or job title for confirmation.
+    remote_loc = bool(re.search(r'\bremote\b|\bwork from home\b|\bwfh\b|\banywhere\b', loc + ' ' + str(job.get('title') or '').lower()))
+    india_loc = bool(re.search(r'\bindia\b|\bbengaluru\b|\bbangalore\b|\bsrinagar\b|\bkarnataka\b', loc))
+    worldwide_loc = bool(re.search(r'\bworldwide\b|\banywhere in the world\b|\bglobal\b', loc))
+    india_explicit = bool(re.search(r'\bremote[ ,:/-]*(?:[-–] )?india\b|\bindia[ ,:/-]*remote\b|\bwork remotely from india\b|\bremote.*?india eligible\b', text))
+    if remote_loc and (india_loc or worldwide_loc or india_explicit):
+        return 'Eligible', 'Remote role with India/worldwide eligibility indicated; verify before applying'
+    if remote_loc or remote:
+        return 'Verify', 'Remote mentioned, but India eligibility or work arrangement is unconfirmed'
+    return 'Exclude', 'No evidence this is a fully remote job'
+
+
 def evaluate(job):
     title = str(job.get('title') or '').lower()
     desc = str(job.get('description') or '').lower()
@@ -297,7 +325,8 @@ if page=='Dashboard':
 elif page=='Discover jobs':
     st.info('Search both career tracks separately. Google Jobs may include LinkedIn/Naukri apply links, but it is not a direct feed from either site.')
     chosen_track=st.radio('Career track',['Both tracks','Sales / Education','Growth / Product'],horizontal=True)
-    only_india=st.checkbox('Prefer India/Bengaluru or India-eligible remote roles',value=True)
+    st.caption('Remote only · must permit working from India · India and international employers')
+    show_unverified=st.checkbox('Show remote jobs requiring India eligibility verification',value=False)
     salary_filter=st.checkbox('Hide jobs with a disclosed INR salary below ₹12 LPA',value=True)
     c1,c2=st.columns(2)
     with c1:
@@ -307,7 +336,7 @@ elif page=='Discover jobs':
         greenhouse=st.text_input('Greenhouse board tokens (comma-separated)',placeholder='e.g. companyname')
         lever=st.text_input('Lever site tokens (comma-separated)',placeholder='e.g. companyname')
         min_score=st.slider('Minimum relevance score',0,100,55)
-    google_queries=st.text_area('Google Jobs searches (one per line)', value='program advisor admissions inside sales India\nbusiness development customer success Bengaluru\ngrowth operations product operations India\nassociate product manager growth analyst India', height=115, help='Uses SerpApi Google Jobs when enabled. Each line uses API credits.')
+    google_queries=st.text_area('Google Jobs searches (one per line)', value='remote program advisor India\nremote admissions consultant India\nremote customer success manager India\nremote business development manager India\nremote growth operations India\nremote product operations India', height=115, help='Uses SerpApi Google Jobs when enabled. Each line uses API credits.')
     google_location=st.text_input('Google Jobs location', 'India')
     google_pages=st.selectbox('Pages per Google Jobs search', [1,2,3], index=0)
     if 'Google Jobs (India · LinkedIn/Naukri links when available)' in sources:
@@ -338,11 +367,11 @@ elif page=='Discover jobs':
             score,reasons,jobtrack=evaluate(j)
             if chosen_track != 'Both tracks' and jobtrack != chosen_track: continue
             if jobtrack == 'Other': continue
-            loc = j['location'].lower()
-            if only_india and loc not in ('', 'not specified') and not any(x in loc for x in ['india','bengaluru','bangalore','karnataka','srinagar','kashmir','remote']): continue
+            eligibility, eligibility_reason = remote_eligibility(j)
+            if eligibility == 'Exclude' or (eligibility == 'Verify' and not show_unverified): continue
             pay = salary_lpa(j.get('salary'))
             if salary_filter and pay and pay[1] < PROFILE['salary_min_lpa']: continue
-            if score>=min_score: result.append({**j,'score':score,'reasons':reasons,'track':jobtrack})
+            if score>=min_score: result.append({**j,'score':score,'reasons':reasons,'track':jobtrack,'remote_status':eligibility,'remote_reason':eligibility_reason})
         result.sort(key=lambda j:j['score'],reverse=True)
         st.session_state['discover_results']=result[:200]
         st.session_state['discover_errors']=errors
@@ -356,6 +385,7 @@ elif page=='Discover jobs':
     for j in results:
         with st.expander(f"{j['score']}/100 · {j['title']} — {j['company']} ({j['location']})"):
             st.write('**Track:**',j['track'],'| **Source:**',j['source'],'| **Salary:**',j['salary'] or 'Not published / unverified')
+            st.write('**Remote eligibility:**',j.get('remote_status','Unverified'), '—', j.get('remote_reason','Verify before applying'))
             for r in j['reasons']: st.write('• '+r)
             st.link_button('Open application page ↗',j['url'])
             st.caption(j['description'][:1000]+('…' if len(j['description'])>1000 else ''))
@@ -494,7 +524,7 @@ elif page=='Settings':
     st.write('Job sources: Google Jobs (optional SerpApi), Remotive, Arbeitnow, Greenhouse boards, Lever sites')
     st.info('To enable Google Jobs, create a SerpApi account, obtain an API key, and add SERPAPI_KEY = \"your-key\" to Streamlit Cloud → App settings → Secrets. Keep existing secrets unchanged. SerpApi may have usage limits or charges. LinkedIn/Naukri listings are not guaranteed.')
     st.write('Scoring: transparent role/skills/location/seniority heuristic; salary filters apply only to clearly comparable INR pay disclosures.')
-    st.write('Profile defaults: 4.2 years experience; target ₹12–18 LPA; remote/India/Bengaluru preferred.')
+    st.write('Profile defaults: 4.2 years experience; target ₹12–18 LPA; remote only, must permit work from India.')
     st.write('Two tracks: Sales / Education and Growth / Product. The app does not directly scrape LinkedIn or Naukri, automatically submit applications, or message recruiters. Google Jobs may include links to those sites.')
     st.write('Optional AI resume drafting: set OPENAI_API_KEY in Streamlit Secrets. API usage may incur charges; your uploaded resume and JD are sent to the AI provider only on Generate.')
     st.caption('Configure APP_PASSWORD, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, and optionally SERPAPI_KEY in Streamlit Secrets. Never commit keys to GitHub.')
